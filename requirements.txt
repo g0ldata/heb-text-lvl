@@ -18,5 +18,5 @@ python-dotenv>=1.0.0
 statsmodels>=0.14.0
 matplotlib>=3.7.0
 requests>=2.31.0
-bert-score
-sacrebleu
+bert-score>=0.3.13
+sacrebleu>=2.4.0
