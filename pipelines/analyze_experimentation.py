@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import logging
 from pathlib import Path
 import re
 import sys
@@ -12,6 +13,10 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import numpy as np
 import pandas as pd
 from scipy import stats
+
+import sacrebleu
+from bert_score import score as bert_score_fn
+
 
 PROJECT_ROOT = (
     Path(__file__).resolve().parent.parent
@@ -33,10 +38,45 @@ from hebrew_readability.config import (
     SPECIAL_L2_TRACK_LEVELS,
     build_empirical_level_anchor_map,
     compute_scale_normalized_iqr_distance,
+    setup_pipeline_logger,
 )
 
 PROMPT_ORDER = ["agentic", "feature_informed", "few_shot_persona", "cot_persona"]
 
+NIKKUD_STRIP_RE = re.compile(r"[\u0591-\u05C7]")
+
+
+def compute_preservation_batch(
+    sources: List[str],
+    simplified: List[str],
+    model_type: str = "dicta-il/dictabert",
+    num_layers: int = 12,
+    batch_size: int = 32,
+) -> Tuple[List[float], List[float]]:
+    """Computes Nikkud-stripped DictaBERT BERTScore-F1 and chrF++ across all rows in batch."""
+    import sacrebleu
+    from bert_score import score as bert_score_fn
+
+    clean_srcs = [NIKKUD_STRIP_RE.sub("", str(s or "")).strip() for s in sources]
+    clean_hyps = [NIKKUD_STRIP_RE.sub("", str(h or "")).strip() for h in simplified]
+
+    _, _, f1_tensor = bert_score_fn(
+        clean_hyps,
+        clean_srcs,
+        model_type=model_type,
+        num_layers=num_layers,
+        batch_size=batch_size,
+        verbose=False,
+    )
+    bert_f1_scores = [round(float(v), 4) for v in f1_tensor.tolist()]
+
+    chrf_scores = [
+        round(float(sacrebleu.sentence_chrf(h, [s], word_order=2).score), 2)
+        if (h and s)
+        else 0.0
+        for h, s in zip(clean_hyps, clean_srcs)
+    ]
+    return bert_f1_scores, chrf_scores
 
 def parse_simplified_level_string(simp_lvl_str: str) -> Tuple[List[str], Dict[str, float]]:
     """Parses '5 (48.2%), 6 (51.8%)' into matched level keys and probabilities."""
@@ -240,7 +280,18 @@ def paired_wilcoxon_with_rank_biserial(
         "n_nonzero": int(n_nz),
     }
 
-
+def safe_friedman_test(
+    piv_df: pd.DataFrame, columns: List[str]
+) -> Tuple[float, float]:
+    """Runs the non-parametric Friedman omnibus test across matched columns."""
+    try:
+        stat_v, p_v = stats.friedmanchisquare(
+            *[piv_df[col].to_numpy() for col in columns]
+        )
+        return round(float(stat_v), 4), round(float(p_v), 6)
+    except Exception:
+        return 0.0, 1.0
+        
 def analyze_experimentation_results(
     results_csv: Path,
     output_dir: Optional[Path] = None,
@@ -256,10 +307,19 @@ def analyze_experimentation_results(
     out_dir = Path(output_dir) if output_dir is not None else results_csv.parent
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    logger = setup_pipeline_logger(
+        name="AnalyzeExperimentation",
+        artifact_dir=str(out_dir),
+        log_filename="experimentation_analysis.log",
+    )
+
     enriched_candidate = results_csv if results_csv.stem.endswith("_enriched") else results_csv.with_name(results_csv.stem + "_enriched.csv")
     df = pd.read_csv(enriched_candidate if enriched_candidate.exists() else results_csv)
+    for _col in ("paragraph_id", "target_level", "prompt"):
+        if _col in df.columns:
+            df[_col] = df[_col].astype(str).str.strip()
     df = df.drop_duplicates(subset=["paragraph_id", "target_level", "prompt"], keep="last").reset_index(drop=True)
-
+    
     empirical_anchor_map = build_empirical_level_anchor_map()
     if {"target_level", "target_mu"}.issubset(df.columns):
         for _, r_mu in df[["target_level", "target_mu"]].dropna().drop_duplicates().iterrows():
@@ -414,6 +474,42 @@ def analyze_experimentation_results(
         )
 
     row_df = pd.DataFrame(row_records)
+    has_bert = (
+        "dictabert_bertscore_f1" in row_df.columns
+        and row_df["dictabert_bertscore_f1"].notna().all()
+    )
+    has_chrf = (
+        "chrf_plus_plus" in row_df.columns
+        and row_df["chrf_plus_plus"].notna().all()
+    )
+    if not (has_bert and has_chrf):
+        bert_scores, chrf_scores = compute_preservation_batch(
+            row_df["text"].tolist(),
+            row_df["simplified_text"].tolist(),
+        )
+        if not has_bert:
+            row_df["dictabert_bertscore_f1"] = bert_scores
+        if not has_chrf:
+            row_df["chrf_plus_plus"] = chrf_scores
+    else:
+        row_df["dictabert_bertscore_f1"] = row_df["dictabert_bertscore_f1"].astype(float).round(4)
+        row_df["chrf_plus_plus"] = row_df["chrf_plus_plus"].astype(float).round(2)
+    
+    if not (has_bert and has_chrf):
+        logger.info("Computing Nikkud-stripped DictaBERT BERTScore-F1 and chrF++ for %d rows...", len(row_df))
+        bert_scores, chrf_scores = compute_preservation_batch(
+            row_df["text"].tolist(),
+            row_df["simplified_text"].tolist(),
+        )
+        if not has_bert:
+            row_df["dictabert_bertscore_f1"] = bert_scores
+        if not has_chrf:
+            row_df["chrf_plus_plus"] = chrf_scores
+    else:
+        logger.info("Reusing precomputed DictaBERT BERTScore-F1 and chrF++ columns from input CSV.")
+        row_df["dictabert_bertscore_f1"] = row_df["dictabert_bertscore_f1"].astype(float).round(4)
+        row_df["chrf_plus_plus"] = row_df["chrf_plus_plus"].astype(float).round(2)
+    
     row_df.to_csv(out_dir / "row_level_proximity_analysis.csv", index=False)
 
     # 1. Method Quality Summary (4 rows)
@@ -443,6 +539,10 @@ def analyze_experimentation_results(
             std_simplified_score=("simplified_score", lambda s: round(s.std(), 4)),
             mean_words=("simplified_words", lambda s: round(s.mean(), 1)),
             mean_compression_ratio=("compression_ratio", lambda s: round(s.mean(), 2)),
+            mean_bertscore_f1=("dictabert_bertscore_f1", lambda s: round(s.mean(), 4)),
+            std_bertscore_f1=("dictabert_bertscore_f1", lambda s: round(s.std(), 4)),
+            mean_chrf_plus_plus=("chrf_plus_plus", lambda s: round(s.mean(), 2)),
+            std_chrf_plus_plus=("chrf_plus_plus", lambda s: round(s.std(), 2)),
         )
         .sort_values("exact_iqr_hit_pct", ascending=False)
     )
@@ -470,6 +570,8 @@ def analyze_experimentation_results(
             mean_weighted_grade_err=("weighted_grade_err", lambda s: round(s.mean(), 4)),
             mean_min_iqr_grade_err=("min_iqr_grade_err", lambda s: round(s.mean(), 4)),
             mean_score=("simplified_score", lambda s: round(s.mean(), 4)),
+            mean_bertscore_f1=("dictabert_bertscore_f1", lambda s: round(s.mean(), 4)),
+            mean_chrf_plus_plus=("chrf_plus_plus", lambda s: round(s.mean(), 2)),
         )
     )
     level_by_method.to_csv(out_dir / "level_by_method_summary.csv", index=False)
@@ -490,21 +592,21 @@ def analyze_experimentation_results(
     piv_exact = row_df.pivot_table(index=["paragraph_id", "target_level"], columns="prompt", values="exact_iqr_hit", aggfunc="last").dropna()
     piv_min_err = row_df.pivot_table(index=["paragraph_id", "target_level"], columns="prompt", values="min_iqr_grade_err", aggfunc="last").dropna()
     piv_w_err = row_df.pivot_table(index=["paragraph_id", "target_level"], columns="prompt", values="weighted_grade_err", aggfunc="last").dropna()
+    piv_bert = row_df.pivot_table(index=["paragraph_id", "target_level"], columns="prompt", values="dictabert_bertscore_f1", aggfunc="last").dropna()
+    piv_chrf = row_df.pivot_table(index=["paragraph_id", "target_level"], columns="prompt", values="chrf_plus_plus", aggfunc="last").dropna()
 
     if len(available_prompts) >= 2 and len(piv_exact) > 0:
         q_stat, q_pval = cochrans_q_test(piv_exact[available_prompts].to_numpy())
-        try:
-            f_stat, f_pval = stats.friedmanchisquare(
-                *[piv_min_err[p].to_numpy() for p in available_prompts]
-            )
-            f_stat, f_pval = round(float(f_stat), 4), round(float(f_pval), 6)
-        except Exception:
-            f_stat, f_pval = 0.0, 1.0
+        f_stat, f_pval = safe_friedman_test(piv_min_err, available_prompts)
+        f_bert_stat, f_bert_pval = safe_friedman_test(piv_bert, available_prompts)
+        f_chrf_stat, f_chrf_pval = safe_friedman_test(piv_chrf, available_prompts)
 
         baselines = [p for p in available_prompts if p != "agentic"]
         mcnemar_raw_p: List[float] = []
         wilcox_min_raw_p: List[float] = []
         wilcox_w_raw_p: List[float] = []
+        wilcox_bert_raw_p: List[float] = []
+        wilcox_chrf_raw_p: List[float] = []
         temp_records: List[Dict[str, Any]] = []
 
         for base_p in baselines:
@@ -519,9 +621,19 @@ def analyze_experimentation_results(
             wx_w = paired_wilcoxon_with_rank_biserial(
                 piv_w_err[base_p].to_numpy(), piv_w_err["agentic"].to_numpy()
             )
+            wx_bert = paired_wilcoxon_with_rank_biserial(
+                piv_bert["agentic"].to_numpy(), piv_bert[base_p].to_numpy()
+            )
+            wx_chrf = paired_wilcoxon_with_rank_biserial(
+                piv_chrf["agentic"].to_numpy(), piv_chrf[base_p].to_numpy()
+            )
+
             mcnemar_raw_p.append(mc["p_value_raw"])
             wilcox_min_raw_p.append(wx_min["p_value_raw"])
             wilcox_w_raw_p.append(wx_w["p_value_raw"])
+            wilcox_bert_raw_p.append(wx_bert["p_value_raw"])
+            wilcox_chrf_raw_p.append(wx_chrf["p_value_raw"])
+
             temp_records.append(
                 {
                     "comparison": f"agentic vs. {base_p}",
@@ -530,6 +642,10 @@ def analyze_experimentation_results(
                     "cochran_q_p_value": q_pval,
                     "friedman_chi2_omnibus": f_stat,
                     "friedman_p_value": f_pval,
+                    "friedman_bertscore_chi2": f_bert_stat,
+                    "friedman_bertscore_p_value": f_bert_pval,
+                    "friedman_chrf_chi2": f_chrf_stat,
+                    "friedman_chrf_p_value": f_chrf_pval,
                     **mc,
                     "wilcoxon_min_iqr_err_stat": wx_min["wilcoxon_stat"],
                     "wilcoxon_min_iqr_err_p_raw": wx_min["p_value_raw"],
@@ -537,22 +653,33 @@ def analyze_experimentation_results(
                     "wilcoxon_weighted_err_stat": wx_w["wilcoxon_stat"],
                     "wilcoxon_weighted_err_p_raw": wx_w["p_value_raw"],
                     "wilcoxon_weighted_rank_biserial_r_rb": wx_w["rank_biserial_r_rb"],
+                    "wilcoxon_bertscore_stat": wx_bert["wilcoxon_stat"],
+                    "wilcoxon_bertscore_p_raw": wx_bert["p_value_raw"],
+                    "wilcoxon_bertscore_rank_biserial_r_rb": wx_bert["rank_biserial_r_rb"],
+                    "wilcoxon_chrf_stat": wx_chrf["wilcoxon_stat"],
+                    "wilcoxon_chrf_p_raw": wx_chrf["p_value_raw"],
+                    "wilcoxon_chrf_rank_biserial_r_rb": wx_chrf["rank_biserial_r_rb"],
                 }
             )
 
         mc_adj = holm_bonferroni_adjust(mcnemar_raw_p)
         wx_min_adj = holm_bonferroni_adjust(wilcox_min_raw_p)
         wx_w_adj = holm_bonferroni_adjust(wilcox_w_raw_p)
+        wx_bert_adj = holm_bonferroni_adjust(wilcox_bert_raw_p)
+        wx_chrf_adj = holm_bonferroni_adjust(wilcox_chrf_raw_p)
 
         for idx, rec in enumerate(temp_records):
             rec["mcnemar_p_holm_bonferroni"] = mc_adj[idx]
             rec["wilcoxon_min_iqr_err_p_holm"] = wx_min_adj[idx]
             rec["wilcoxon_weighted_err_p_holm"] = wx_w_adj[idx]
+            rec["wilcoxon_bertscore_p_holm"] = wx_bert_adj[idx]
+            rec["wilcoxon_chrf_p_holm"] = wx_chrf_adj[idx]
             stat_rows.append(rec)
 
     paired_stats_df = pd.DataFrame(stat_rows)
     paired_stats_df.to_csv(out_dir / "paired_statistical_tests.csv", index=False)
-
+    logger.info("Exported proximity and paired statistical analysis tables to %s", out_dir)
+    
     return {
         "row_level": row_df,
         "method_summary": method_summary,
@@ -580,10 +707,13 @@ if __name__ == "__main__":
     )
     parser.add_argument("--output-dir", type=Path, default=PROJECT_ROOT / "artifacts")
     args = parser.parse_args()
+
+    cli_logger = setup_pipeline_logger(
+        name="AnalyzeExperimentation",
+        artifact_dir=str(args.output_dir),
+        log_filename="experimentation_analysis.log",
+    )
     outputs = analyze_experimentation_results(args.results_csv, args.output_dir)
-    print("\n=== 1. METHOD QUALITY SUMMARY ===")
-    print(outputs["method_summary"].to_string(index=False))
-    print("\n=== 2. EXACT 14 x 4 PER-LEVEL HIT RATE TABLE ===")
-    print(outputs["pivot_14x4"].to_string(index=False))
-    print("\n=== 3. PAIRED STATISTICAL TESTS (McNEMAR & WILCOXON) ===")
-    print(outputs["paired_tests"].to_string(index=False))
+    cli_logger.info("\n=== 1. METHOD QUALITY SUMMARY ===\n%s", outputs["method_summary"].to_string(index=False))
+    cli_logger.info("\n=== 2. EXACT 14 x 4 PER-LEVEL HIT RATE TABLE ===\n%s", outputs["pivot_14x4"].to_string(index=False))
+    cli_logger.info("\n=== 3. PAIRED STATISTICAL TESTS (McNEMAR & WILCOXON) ===\n%s", outputs["paired_tests"].to_string(index=False))
