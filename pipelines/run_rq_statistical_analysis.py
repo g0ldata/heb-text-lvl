@@ -18,17 +18,21 @@ PROJECT_ROOT = (
     if "__file__" in globals()
     else Path("/content/heb-text-lvl")
 )
-if str(PROJECT_ROOT / "src") not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT / "src"))
-if str(PROJECT_ROOT / "pipelines") not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT / "pipelines"))
+for _p in (str(PROJECT_ROOT), str(PROJECT_ROOT / "src")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
-from analyze_experimentation import analyze_experimentation_results
+from pipelines.analyze_experimentation import (
+    analyze_experimentation_results,
+    compute_preservation_batch,
+)
+
 from hebrew_readability.config import (
     FINAL_FEATURE_ORDER,
     build_empirical_level_anchor_map,
     POPULATION_SPECS,
     RAW_LEVEL_TO_POPULATION,
+    setup_pipeline_logger,
 )
 
 NIKKUD_STRIP_RE = re.compile(r"[\u0591-\u05C7]")
@@ -39,6 +43,19 @@ SORTED_ANCHOR_TIERS = sorted(set(EMPIRICAL_ANCHORS.values()))
 # ---------------------------------------------------------------------------
 # RQ3: 3-Turn Markov Transition Matrix, Hazard Convergence, Ping-Pong & Stagnation
 # ---------------------------------------------------------------------------
+def _classify_turn_state(turn: Dict[str, Any]) -> str:
+    """Maps a single trajectory turn to {S_Complex, S_Converged, S_Simple}."""
+    if turn.get("in_core_iqr"):
+        return "S_Converged"
+    y = float(turn.get("predicted_score", 5.0))
+    q3 = float(turn.get("target_q3", 5.5))
+    q1 = float(turn.get("target_q1", 4.5))
+    if y > q3:
+        return "S_Complex"
+    if y < q1:
+        return "S_Simple"
+    return "S_Converged"
+    
 def run_rq3_markov_trajectory_analysis(
     trajectories_jsonl: Path, output_dir: Path
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -67,18 +84,6 @@ def run_rq3_markov_trajectory_analysis(
     ping_pong_transitions = 0
     total_non_conv_transitions = 0
     stagnant_transitions = 0
-
-    def _classify_turn_state(t: Dict[str, Any]) -> str:
-        if t.get("in_core_iqr"):
-            return "S_Converged"
-        y = float(t.get("predicted_score", 5.0))
-        q3 = float(t.get("target_q3", 5.5))
-        q1 = float(t.get("target_q1", 4.5))
-        if y > q3:
-            return "S_Complex"
-        if y < q1:
-            return "S_Simple"
-        return "S_Converged"
 
     for rec in records:
         traj = rec.get("trajectory") or []
@@ -422,6 +427,11 @@ def run_rq6_llm_self_awareness_analysis(
 # ---------------------------------------------------------------------------
 # RQ7: Simplicity-Fidelity Pareto Frontier, Error Taxonomy & Krippendorff's Alpha
 # ---------------------------------------------------------------------------
+def _extract_char_ngrams(text: str, n: int = 3) -> Set[str]:
+    """Extracts whitespace-normalized character n-grams."""
+    normalized = re.sub(r"\s+", " ", text)
+    return {normalized[i : i + n] for i in range(max(1, len(normalized) - n + 1))}
+    
 def compute_nikkud_stripped_semantic_f1(source_text: str, simplified_text: str) -> float:
     """
     Strips Nikkud diacritics and computes character trigram + content token F1 similarity
@@ -432,12 +442,7 @@ def compute_nikkud_stripped_semantic_f1(source_text: str, simplified_text: str) 
     if not src_clean or not simp_clean:
         return 0.0
 
-    # Character 3-gram Jaccard/Dice F1 (robust to Hebrew prefix morphology without Nikkud penalty)
-    def _char_ngrams(s: str, n: int = 3) -> Set[str]:
-        s_norm = re.sub(r"\s+", " ", s)
-        return {s_norm[i : i + n] for i in range(max(1, len(s_norm) - n + 1))}
-
-    g_src = _char_ngrams(src_clean, 3)
+    g_src = _extract_char_ngrams(src_clean, 3)
     g_simp = _char_ngrams(simp_clean, 3)
     overlap = len(g_src & g_simp)
     prec = overlap / max(1, len(g_simp))
@@ -510,19 +515,37 @@ def run_rq7_pareto_and_error_taxonomy(
     25-quadruplet Blind Human Evaluation sheet.
     """
     df_copy = row_df.copy()
-    df_copy["semantic_f1_nikkud_stripped"] = df_copy.apply(
-        lambda r: compute_nikkud_stripped_semantic_f1(r["text"], r["simplified_text"]),
-        axis=1,
+
+    has_bert = (
+        "dictabert_bertscore_f1" in df_copy.columns
+        and df_copy["dictabert_bertscore_f1"].notna().all()
     )
+    has_chrf = (
+        "chrf_plus_plus" in df_copy.columns
+        and df_copy["chrf_plus_plus"].notna().all()
+    )
+    if not (has_bert and has_chrf):
+        bert_scores, chrf_scores = compute_preservation_batch(
+            df_copy["text"].tolist(),
+            df_copy["simplified_text"].tolist(),
+        )
+        if not has_bert:
+            df_copy["dictabert_bertscore_f1"] = bert_scores
+        if not has_chrf:
+            df_copy["chrf_plus_plus"] = chrf_scores
+
     df_copy["composite_pareto_success"] = (
-        (df_copy["exact_iqr_hit"] == 1) & (df_copy["semantic_f1_nikkud_stripped"] >= 0.55)
+        (df_copy["exact_iqr_hit"] == 1) & (df_copy["dictabert_bertscore_f1"] >= 0.75)
     ).astype(int)
 
     pareto_summary = (
         df_copy.groupby("prompt", as_index=False)
         .agg(
             exact_iqr_hit_pct=("exact_iqr_hit", lambda s: round(s.mean() * 100.0, 2)),
-            mean_semantic_f1=("semantic_f1_nikkud_stripped", lambda s: round(s.mean(), 4)),
+            mean_bertscore_f1=("dictabert_bertscore_f1", lambda s: round(s.mean(), 4)),
+            std_bertscore_f1=("dictabert_bertscore_f1", lambda s: round(s.std(), 4)),
+            mean_chrf_plus_plus=("chrf_plus_plus", lambda s: round(s.mean(), 2)),
+            std_chrf_plus_plus=("chrf_plus_plus", lambda s: round(s.std(), 2)),
             mean_compression_ratio=("compression_ratio", lambda s: round(s.mean(), 4)),
             composite_pareto_success_pct=(
                 "composite_pareto_success",
@@ -620,5 +643,10 @@ if __name__ == "__main__":
     parser.add_argument("--output-dir", type=Path, default=PROJECT_ROOT / "artifacts")
     args = parser.parse_args()
 
+    cli_logger = setup_pipeline_logger(
+        name="RQStatisticalAnalysis",
+        artifact_dir=str(args.output_dir),
+        log_filename="rq_analysis.log",
+    )
     res = run_all_research_questions(args.results_csv, args.trajectories_jsonl, args.output_dir)
-    print("\n[✓] RQ1-RQ7 analysis complete. All tables exported to:", args.output_dir)
+    cli_logger.info("RQ1-RQ7 analysis complete. All tables exported to: %s", args.output_dir)
